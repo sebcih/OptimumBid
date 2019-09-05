@@ -1,4 +1,4 @@
-#OptimumBid
+# OptimumBid
 OptimumBid is a bid optimization program that tries to offer bids in day-ahead market in Turkey  such that the profit
 from a thermic power plant is maximized
 # Setup
