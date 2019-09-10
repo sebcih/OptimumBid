@@ -1,41 +1,26 @@
-import pandas as pd
-import numpy as np
-import locale
-from datetime import datetime as dt
-from datetime import timedelta as td
-from collections import defaultdict
-from workalendar.europe import Turkey
+import math
 import csv
 import sys
-import intervaltree
 import warnings
+import locale
+from collections import defaultdict
+from datetime import datetime as dt
+from datetime import timedelta as td
+from itertools import groupby
+from calendar import monthrange
 
-class PowerPlant():
-    def __init__(self, data):
-        self.name = data["NAME"][0]
-        self.startup_cost = data["STARTUP_COST"][0]
-        self.cooldown = data["COOLDOWN"][0]
-        self.marginal_cost = data["EXTRA"][0]
-        self.base_cost = data["BASE"][0]
-        self.max_load = data["MAX_LOAD"][0]
-        self.min_load = data["MIN_LOAD"][0]
-    def cost(self, load):
-        if not (self.min_load <= load <= self.max_load):
-            sys.exit(f"{self.name} has a load of {load} which is out of bounds")
-        return self.min_load * self.base_cost + (load - self.min_load) * self.marginal_cost
-    def revenue(self, load, price):
-        return load * price
-    def optimal_load(self,price):
-        load = self.max_load if price > self.marginal_cost else self.min_load
-        return load
-    def profit(self, price):
-        load = self.optimal_load(price)
-        return self.revenue(price, load) - self.cost(load)
+import numpy as np
+import cvxpy as cp
+import intervaltree
+from workalendar.europe import Turkey
 
-def PowerPlant_factory(filename):
-    data = pd.read_excel(filename, sheet_name = "Data").to_dict()
-    return PowerPlant(data)
+from powerPlant import *
 
+warnings.filterwarnings("ignore") #This is to suprress the calendar warning about Islamic Holidays
+
+RUNS = 25
+
+# This function used to get prices as exported by seffaflik
 def get_prices(filename):
     locale.setlocale(locale.LC_NUMERIC,"tr")
     dolar_prices = defaultdict(lambda: [0] * 24)
@@ -50,127 +35,47 @@ def get_prices(filename):
             dolar_prices[date][hour] = dolar_price
     return dolar_prices, tl_prices
 
-def get_bids(schedule):
-    answer = []
-    current_index = 0
-    current = schedule[0]
-    for index, value in enumerate(schedule):
-        if value == current:
-            pass
-        else:
-            answer.append((current_index, index, current))
-            current_index = index
-            current = value
-    answer.append((current_index, len(schedule), current))
-    return answer
+def get_predictions(filename):
+    tl_predictions = defaultdict(lambda: [0] * 24)
+    data = pd.read_excel(filename, sheet_name = "Data").to_numpy()
+    for row in data:
+        tl_predictions[row[0]][row[1]] = list(row[2:9])
+    return tl_predictions
 
-def create_bid(working, bids):
-    answer = []
-    for index, bid in enumerate(bids):
-        if working and index < len(bids) - 1 and bids[index + 1][2] == True:
-            answer.append((bid[0], bid[1], -1))
-        elif bid[2] == True:
-            answer.append((bid[0], bid[1], 1))
-        else:
-            answer.append((bid[0], bid[1], 0))
-    return answer
 
-def get_bid_values(prices, schedule, power_plant):
-    loads = [power_plant.optimal_load(price) for price in prices]
-    costs = [power_plant.cost(load) for load in loads]
-    ans = []
-    for bid in schedule:
-        ans.append(((sum(costs[bid[0]:bid[1]])) + (bid[2] * power_plant.startup_cost)) / sum(loads[bid[0]:bid[1]]))
-    return ans
-
-def optimal_schedule(profits, working, power_plant):
-    answer = []
-    i = 0
-    while i < len(profits):
-        # print(f"i: {i}")
-        if working:
-            if profits[i] > 0:
-                answer.append(True)
-                working = True
-            else:
-                potential = 0
-                j = i
-                while j < len(profits):
-                    potential += profits[j]
-                    # print(f"potential: {potential}")
-                    if j - i < power_plant.cooldown:
-                        if potential > 0:
-                            answer += [True] * (j - i)
-                            # working = True
-                            i = j - 1
-                            # print(f"K")
-                            break
-                        elif j == (len(profits) - 1):
-                            answer += [False] * (j- i)
-                            working = False
-                            i = j -1
-                            # print(f"J")
-                            break
-                    else:
-                        # print(f"j: {j}")
-                        # print(f"ii: {i}")
-                        if potential < (-1 * power_plant.startup_cost):
-                            answer += [False] * (j - i)
-                            working = False
-                            i = j - 1
-                            # print(f"H")
-                            break
-                        if potential > 0:
-                            answer += [True] * (j - i)
-                            working = True
-                            i = j - 1
-                            # print(f"G")
-                            break
-                        if j == (len(profits) - 1) and potential <= 0: #TODO: it does not have to end at midnight
-                            answer += [False] * (j - i)
-                            working = False
-                            # print(f"F")
-                            i = j - 1
-                    j += 1
+#MIP is setup in this function
+def solver(profits, is_working, power_plant):
+    hours = len(profits)
+    startup_costs = [power_plant.startup_cost] * hours # This used as an array in case startup is variable instead of constant in future
+    workings = cp.Variable(hours, boolean = True)
+    startups = cp.Variable(hours, boolean = True)
+    shutdowns = cp.Variable(hours, boolean = True)
+    constraints = []
+    for hour in range(hours):
+        if hour == 0:
+            constraints.append(workings[hour] - is_working == startups[hour] - shutdowns[hour]) #if we did not work before but work now we have done a startup if we don't work now but worked before then we had a shutdown
         else:
-            if profits[i] < 0:
-                answer.append(False)
-                working = False
-                # print(f"D")
-            else:
-                potential_profit = 0
-                j = i
-                while j < len(profits):
-                    potential_profit += profits[j]
-                    if potential_profit > power_plant.startup_cost:
-                        answer += [True] * (j - i)
-                        working = True
-                        i = j - 1
-                        # print(f"C")
-                        break
-                    elif potential_profit < 0:
-                        answer += [False] * (j - i)
-                        working = False
-                        i = j -1
-                        # print(f"B")
-                        break
-                    if j == len(profits) - 1 and potential_profit <= power_plant.startup_cost:
-                        answer += [False] * (j - i)
-                        working = False
-                        i = j - 1
-                        # print(f"A")
-                    j += 1
-        i += 1
-    return answer[0:24]
+            constraints.append(workings[hour] - workings[hour - 1] == startups[hour] - shutdowns[hour])
+        if hour >= power_plant.cooldown:
+            constraints.append(cp.sum(shutdowns[(hour - power_plant.cooldown) + 1 : hour + 1]) <= (1 - workings[hour])) #can't work if we had a shutdown in the last COOLDOWN hours
+    objective = cp.Maximize(cp.sum(profits @ workings) - cp.sum(startup_costs @ startups))
+    prob = cp.Problem(objective, constraints)
+    prob.solve()
+    return workings.value.round().astype(bool) #Internally cvxpy keeps all values as floats so we round and cast into bool
+
+def optimal_schedule(profits, is_working, power_plant):
+    workings = solver(profits, is_working, power_plant)[0:24] #limit answer to 1 day
+    schedule = []
+    for value, group in groupby(range(len(workings)), key = lambda x: workings[x]):
+        group = list(group)
+        schedule.append((group[0], group[-1] + 1, value)) #The format for bids is [x, y) thus we need to add + 1 to second item.
+    return schedule
 
 def sort_intervals(intervals):
     tree = intervaltree.IntervalTree()
     interval_counts = defaultdict(lambda: 0)
     for i in intervals:
         interval_counts[i] = interval_counts[i] + 1
-    isss = [(key[0],key[1],value) for key,value in interval_counts.items()]
-    isss.sort(key = lambda x: x[2], reversed = True)
-    print(isss)
     for key, value in interval_counts.items():
             tree.add(intervaltree.Interval(key[0], key[1] + 1, value))
     answer = []
@@ -178,7 +83,7 @@ def sort_intervals(intervals):
         answer.append((sum(value[2] for value in tree.at(i))))
     return answer
 
-def fun(prices, breaks, main_block, power_plant, is_working):
+def give_prices(prices, breaks, main_block, power_plant, is_working):
     loads = [power_plant.optimal_load(price) for price in prices]
     costs = [power_plant.cost(load) for load in loads]
     cost_block = [sum(costs[b[0]:b[1]]) for b in breaks]
@@ -186,125 +91,110 @@ def fun(prices, breaks, main_block, power_plant, is_working):
     cost_block[0] -= power_plant.startup_cost if is_working and main_block == 1 else 0
     return [(b[0], b[1], (cost_block[i] / sum(loads[b[0]:b[1]]))) for i, b in enumerate(breaks)]
 
-def evaluate_bid(bids, prices, power_plant, is_working):
-    profits = [power_plant.profit(price) for price in prices]
-    net_profit = 0
-    for index, bid in enumerate(bids):
-        if is_working:
-            if np.array(prices[bid[0]:bid[1]]).mean() >= bid[2]:
-                net_profit += sum(profits[bid[0]:bid[1]])
-                is_working = True
-            else:
-                is_working = False
-        else:
-            start = bid[0] if index == 0 else max(bids[index -1][0] + power_plant.cooldown, bid[0])
-            start = int(start)
-            if len(prices[start:bid[1]]) > 0 and np.array(prices[start:bid[1]]).mean() >= bid[2]:
-                net_profit += (sum(profits[start:bid[1]]) - power_plant.startup_cost)
-                is_working = True
-            else:
-                is_working = False
-    return net_profit
 
-def drop_startups(max_profit, is_working, schedule):
-    for x, y, state in schedule:
-        if is_working and not state:
-            is_working = False
-        if state and not is_working:
-            is_working = True
-            max_profit -= BND2.startup_cost
-    return max_profit
+def calculate_variances(prices, date):
+    workday_variance_lists = [[] for i in range(24)]
+    holiday_variance_lists = [[] for i in range(24)]
+    first_day_of_month = dt(date.year, date.month, 1)
+    for day in (first_day_of_month + td(days = n) for n in range(monthrange(date.year, date.month)[1])):
+        if day in prices:
+            for hour in range(24):
+                if cal.is_working_day(day):
+                    workday_variance_lists[hour].append(prices[day][hour])
+                else:
+                    holiday_variance_lists[hour].append(prices[day][hour])
+    workday_variances = [np.array(variances).var() for variances in workday_variance_lists]
+    holiday_variances = [np.array(variances).var() for variances in holiday_variance_lists]
+    return workday_variances, holiday_variances
 
-cal = Turkey()
-BND2 = PowerPlant_factory("cem.xlsx")
-dolar_prices, tl_prices = get_prices('PTF-01082009-01082019.csv')
+def report(day, tl_predictions, workday_variances, holiday_variances, is_working, power_plant, alpha):
+    print("Fiyat Tahmini Datasina Gore En iyi Calisma Sekilleri Uretiliyor")
+    today = day
+    tomorrow = today + td(days = 1)
+    if today not in tl_predictions:
+            print("Fiyat tahmin verisi yok")
+            sys.exit()
+    prices = tl_predictions[day]
+    variances = workday_variances if cal.is_working_day(day) else holiday_variances
+    if tomorrow not in tl_predictions:
+        print("Yarinin fiyat tahmini bulunamadi. Santralin saat 24 te kapanmasi gerektigi varsayiliyor")
+    else:
+        prices += tl_predictions[tomorrow]
+        variances += workday_variances if cal.is_working_day(day) else holiday_variances
+    return generate_intervals(prices, variances, alpha)
 
-intervals = []
-monthly_bids = {}
-c = []
-max_profits = {}
-a = defaultdict(lambda:0)
-is_working = False
-monthly_results = []
-for mon in range(1,4):
-    for day, prices in tl_prices.items():
-        if cal.is_working_day(day) and day.month == mon and day.year == 2019:
-            profits = [BND2.profit(price) for price in tl_prices[day]]
-            schedule = get_bids(optimal_schedule(profits, is_working, BND2))
-            # print(is_working)
-            max_profit = sum([sum(profits[bid[0]:bid[1]]) for bid in schedule if bid[2]])
-            max_profit = drop_startups(max_profit, is_working, schedule)
-            max_profits[day] = max_profit
-            b = []
-            for i in range(3,22):
-                for j in range(i+3, 24):
-                    blocks = [sum(profits[0:i]), sum(profits[i:j]), sum(profits[j:24])]
-                    main_block = blocks.index(max(blocks))
-                    n = evaluate_bid(fun(tl_prices[day], [(0,i), (i,j), (j,24)], main_block, BND2, is_working), tl_prices[day], BND2, is_working)
-                    a[(i,j)] += n
-                    b.append((i, j, n))
-    ac = [(key[0],key[1],value) for key,value in a.items()]
-    ac.sort(key = lambda x:x[2])
-    top_break_points = ac[-1]
-    results = []
-    for day, prices in tl_prices.items():
-        if cal.is_working_day(day) and day.month == mon and day.year == 2019:
-            profits = [BND2.profit(price) for price in tl_prices[day]]
-            schedule = get_bids(optimal_schedule(profits, is_working, BND2))
-            max_profit = sum([sum(profits[bid[0]:bid[1]]) for bid in schedule if bid[2]])
-            max_profit = drop_startups(max_profit, is_working, schedule)
-            max_profits[day] = max_profit
-            n = (evaluate_bid(fun(tl_prices[day], [(0,top_break_points[0]), (top_break_points[0],top_break_points[1]), (top_break_points[1],24)], main_block, BND2, is_working), tl_prices[day], BND2, is_working))
-            if max_profit == 0:
-                results.append(1)
-            else:
-                results.append(n / max_profit)
-    monthly_results.append((np.array(results).mean()))
+def generate_intervals(prices, variances, alpha):
+    intervals = []
+    for level in range(7):
+        print(f"PF + {(level - 3) * 500}")
+        print(f"\tSchedule According to Actual Data")
+        profits = [BND2.profit(hour[level]) for hour in prices]
+        schedule = optimal_schedule(profits, is_working, BND2)
+        print(f"\t {schedule}")
+        for interval in schedule:
+            intervals.append(interval)
+        print(f"\tSchedule According to Data + Noise")
+        for possiblity in range(RUNS):
+            profits = []
+            for i, hour in enumerate(tl_predictions[day]):
+                noise = np.random.normal(loc = 0, scale = alpha * math.sqrt(variances[i]))
+                profits.append(BND2.profit(hour[level] + noise))
+            schedule = optimal_schedule(profits, is_working, BND2)
+            print(f"\t {schedule}")
+            for interval in schedule:
+                intervals.append(interval)
+    return intervals
 
-print(np.array(monthly_results).mean())
+def print_schedule(schedule):
+    schedule_for_printing = [(interval[0], interval[1]) for interval in schedule]
+    print("I think the optimum bid structure is the following:")
+    print(schedule_for_printing)
+    for index, item in enumerate(schedule):
+        if item[1] - item[0] < 3:
+            print(f"{schedule_for_printing[index]} is given as hourly")
+
+def create_bid_schedule_for_3(max_index, min_index, is_working):
+    schedule = ([(0, min_index, True), (min_index, max_index, False), (max_index, 24, True)] if is_working else
+                [(0, max_index, False), (max_index, min_index, True), (min_index, 24, False)])
+    print_schedule(schedule)
+    return schedule
 
 
-# iss = [(i,j) for i,j,n in monthly_bids.values()]
-# sort_intervals(iss)
-# print(np.array(c).mean())
+def create_bid_schedule_for_2(max_index, min_index, is_working):
+    index = max_index if max_index - 1 != 0 else min_index
+    schedule = [(0, index, True), (index, 24, False)] if min_index != 0 else [(0, index, False), (index, 24, True)]
+    print_schedule(schedule)
+    return schedule
 
 
+def get_break_points(intervals):
+    filtered_intervals = [interval for interval in intervals if interval[2]]
+    interval_counts = (sort_intervals(filtered_intervals))
+    interval_counts_diff = list(np.diff(interval_counts))
+    max_index = interval_counts_diff.index(max(interval_counts_diff)) + 1
+    min_index = interval_counts_diff.index(min(interval_counts_diff))
+    return max_index, min_index
 
-# is_working = False
-# profits = [BND2.profit(price) for price in tl_prices[dt(2019,1,29)]]
-# schedule = get_bids(optimal_schedule(profits, is_working, BND2))
-# max_profit = sum([sum(profits[bid[0]:bid[1]]) for bid in schedule if bid[2]])
-# max_profit = drop_startups(max_profit, is_working, schedule)
-# actual_bid = fun(tl_prices[dt(2019,1,29)], [(0,16), (16,21), (21,24)], 1, BND2, is_working)
-# n = evaluate_bid(actual_bid,  tl_prices[dt(2019,1,29)], BND2, is_working)
+if __name__ == "__main__":
+    cal = Turkey()
+    BND2 = power_plant_factory("power_plant_data.xlsx")
+    dolar_prices, tl_prices = get_prices('prices.csv')
+    tl_predictions = get_predictions("KapasiteSensitivity.xlsx")
+    day = dt.strptime(sys.argv[1], "%d/%m/%Y") if len(sys.argv) > 2 else dt.today().replace(hour = 0, minute = 0, second = 0, microsecond = 0)
+    is_working = sys.argv[2] if len(sys.argv) > 2 else 0
+    workday_variances, holiday_variances = calculate_variances(tl_prices, day)
+    alpha = 1
 
-# print(profits)
-# print(schedule)
-# print(max_profit)
-# print(actual_bid)
-# print(n)
+    intervals = report(day, tl_predictions, workday_variances, holiday_variances, is_working, BND2, alpha)
+    max_index, min_index = get_break_points(intervals)
+    #We can use a gradient search here to maybe decide what kind of noise produce most stable results
+    while max_index - 1 == 0 and min_index == 0:
+        alpha *= 1.5
+        print(f"No break points with normal variance increased variance to {alpha} times its real value")
+        intervals = report(day, tl_predictions, workday_variances, holiday_variances, is_working, BND2, alpha)
+        max_index, min_index = get_break_points(intervals)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-        # intervals += [(bid[0], bid[1]) for bid in schedule if bid[2]]
-
-# print(sort_intervals(intervals))
+    if max_index - 1 == 0 and min_index == 0:
+        create_bid_schedule_for_2(max_index, min_index, is_working)
+    else:
+        create_bid_schedule_for_3(max_index, min_index, is_working)
